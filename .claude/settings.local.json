@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip --version:*)",
+      "Bash(dbt:*)",
+      "WebFetch(domain:docs.getdbt.com)",
+      "Bash(uv:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}

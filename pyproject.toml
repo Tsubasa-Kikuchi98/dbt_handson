@@ -1,0 +1,13 @@
+[project]
+name = "dbt-handson"
+version = "0.1.0"
+description = "dbt core ハンズオン（Snowflake アダプター）"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dbt-core==1.11.5",
+    "dbt-snowflake==1.11.2",
+]
+
+[tool.uv]
+link-mode = "copy"
