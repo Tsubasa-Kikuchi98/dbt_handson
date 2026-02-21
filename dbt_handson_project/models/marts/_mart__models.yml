@@ -1,0 +1,53 @@
+version: 2
+
+models:
+  - name: fct_orders
+    description: "注文ファクトテーブル。1行 = 1注文。"
+    columns:
+      - name: order_id
+        description: "注文の一意識別子"
+        data_tests:
+          - unique
+          - not_null
+      - name: customer_id
+        description: "顧客ID"
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('dim_customers')
+              field: customer_id
+      - name: amount
+        description: "支払金額（ドル）"
+        data_tests:
+          - not_null:
+              config:
+                severity: warn
+
+  - name: dim_customers
+    description: "顧客ディメンションテーブル。属性と注文の集約値を含む。"
+    columns:
+      - name: customer_id
+        description: "顧客の一意識別子"
+        data_tests:
+          - unique
+          - not_null
+      - name: number_of_orders
+        description: "累計注文回数"
+      - name: lifetime_value
+        description: "累計支払額（ドル）"
+
+unit_tests:
+  - name: test_fct_orders_amount_conversion
+    description: "セントからドルへの変換ロジックを検証"
+    model: fct_orders
+    given:
+      - input: ref('int_orders_joined')
+        format: sql
+        rows: |
+          select 1 as order_id, 10 as customer_id, '2024-01-01'::date as order_date, 'completed' as status, 'credit_card' as payment_method, 1500 as amount_cents
+          union all
+          select 2 as order_id, 20 as customer_id, '2024-01-02'::date as order_date, 'placed' as status, 'coupon' as payment_method, 0 as amount_cents
+    expect:
+      rows:
+        - {order_id: 1, customer_id: 10, order_date: "2024-01-01", status: "completed", payment_method: "credit_card", amount: 15.0}
+        - {order_id: 2, customer_id: 20, order_date: "2024-01-02", status: "placed", payment_method: "coupon", amount: 0.0}

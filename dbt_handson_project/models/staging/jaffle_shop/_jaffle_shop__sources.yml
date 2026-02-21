@@ -1,0 +1,63 @@
+version: 2
+
+sources:
+  - name: jaffle_shop
+    description: "Jaffle Shop のソースデータ（ELツールでロード済みを想定）"
+    database: JAFFLE_SHOP_RAW
+    schema: JAFFLE_SHOP
+
+    tables:
+      - name: customers
+        description: "顧客マスタ"
+        columns:
+          - name: id
+            description: "顧客の一意識別子"
+            data_tests:
+              - unique
+              - not_null
+
+      - name: orders
+        description: "注文データ"
+        loaded_at_field: "_etl_loaded_at"
+        freshness:
+          warn_after: {count: 12, period: hour}
+          error_after: {count: 24, period: hour}
+        columns:
+          - name: id
+            description: "注文の一意識別子"
+            data_tests:
+              - unique
+              - not_null
+          - name: user_id
+            description: "注文した顧客のID"
+            data_tests:
+              - not_null
+              - relationships:
+                  to: source('jaffle_shop', 'customers')
+                  field: id
+          - name: status
+            description: "注文ステータス"
+            data_tests:
+              - accepted_values:
+                  values: ['completed', 'returned', 'return_pending', 'placed', 'shipped']
+
+      - name: payments
+        description: "支払データ（金額はセント単位）"
+        columns:
+          - name: id
+            description: "支払の一意識別子"
+            data_tests:
+              - unique
+              - not_null
+          - name: order_id
+            description: "対応する注文のID"
+            data_tests:
+              - not_null
+              - relationships:
+                  to: source('jaffle_shop', 'orders')
+                  field: id
+          - name: payment_method
+            description: "支払方法"
+            data_tests:
+              - accepted_values:
+                  values: ['credit_card', 'coupon', 'bank_transfer', 'gift_card']

@@ -511,6 +511,530 @@ select * from {{ source('app', 'events') }}
 - 各ステップで実際にコマンドを実行して動作を確認する
 - 疑問点はその都度解消しながら進める
 
+---
+---
+
+# dbt Projects on Snowflake ハンズオン
+
+## 概要
+Snowflake のネイティブ dbt 統合を学ぶ。dbt プロジェクトを Snowflake 上のオブジェクトとしてデプロイ・実行・スケジューリング・監視する方法をカバーする。
+
+## 前提
+- dbt Core ハンズオン（Step 1〜11）を完了していること
+- Snowflake アカウントに ACCOUNTADMIN 権限があること
+- GitHub アカウントを持っていること
+- Snowflake CLI（`snow`）がインストール済みであること
+
+## 参考ドキュメント
+- 公式: https://docs.snowflake.com/en/user-guide/data-engineering/dbt-projects-on-snowflake
+- チュートリアル: https://docs.snowflake.com/en/user-guide/tutorials/dbt-projects-on-snowflake-getting-started-tutorial
+- CI/CD チュートリアル: https://docs.snowflake.com/en/user-guide/tutorials/dbt-projects-on-snowflake-ci-cd-tutorial
+
+## 制限事項（事前に把握）
+| 制限 | 内容 |
+|---|---|
+| dbt バージョン | dbt-core 1.9.4 / dbt-snowflake 1.9.2（最新 1.11 ではない） |
+| `env_var()` | 非対応。`--vars` フラグで代替 |
+| ファイル数上限 | プロジェクト内 20,000 ファイルまで |
+| `dbt docs serve` | 非対応（`docs generate` は可能） |
+| リアルタイム出力 | コマンド完了後にのみ出力確認可能 |
+| `--state` フラグ | 非対応（Slim CI は CLI 側で工夫が必要） |
+
+---
+
+## カリキュラム
+
+### Step 1: コンセプトの理解
+
+#### 1-1. dbt Projects on Snowflake の全体像
+- 従来: ローカル or CI 環境で `dbt run` → Snowflake にオブジェクト作成
+- 新方式: dbt プロジェクトを **Snowflake オブジェクト** としてデプロイし、Snowflake 内で実行
+
+#### 1-2. 7ステップワークフロー
+1. プロジェクトを準備（`dbt_project.yml` + `profiles.yml` + `models/`）
+2. 依存パッケージをインストール（`dbt deps`）
+3. **DBT PROJECT オブジェクト**としてデプロイ（`CREATE DBT PROJECT`）
+4. Snowflake 内で実行（`EXECUTE DBT PROJECT`）
+5. Snowflake Task でスケジューリング
+6. CI/CD パイプラインに統合
+7. Snowflake の監視機能でモニタリング
+
+#### 1-3. 主要コンポーネント
+| コンポーネント | 説明 |
+|---|---|
+| **dbt Project Object** | スキーマレベルの Snowflake オブジェクト。バージョン管理された dbt ソースファイルを格納 |
+| **Workspace** | Snowsight 上の Web IDE。Git リポジトリと接続し、dbt プロジェクトを可視化・テスト・実行 |
+| **Snowflake Task** | dbt プロジェクトの定期実行をスケジューリング |
+| **Snowflake CLI (`snow`)** | CLI からのデプロイ・実行。CI/CD 統合に使用 |
+
+#### 1-4. バージョニング
+- 各デプロイで新バージョンが作成される（`VERSION$1`, `VERSION$2`, ...）
+- `CREATE OR REPLACE` でバージョン番号はリセット
+- 特殊参照: `LAST`（最新）, `FIRST`（最古）
+- カスタムエイリアスも設定可能
+
+---
+
+### Step 2: 環境セットアップ
+
+#### 2-1. データベースとスキーマの作成
+```sql
+CREATE DATABASE IF NOT EXISTS DBT_PROJECT_DB;
+CREATE SCHEMA IF NOT EXISTS DBT_PROJECT_DB.INTEGRATIONS;
+CREATE SCHEMA IF NOT EXISTS DBT_PROJECT_DB.DEV;
+CREATE SCHEMA IF NOT EXISTS DBT_PROJECT_DB.PROD;
+```
+
+#### 2-2. GitHub リポジトリの準備
+- 既存の `dbt_handson_project` を GitHub リポジトリにプッシュ
+- `profiles.yml` をプロジェクトルートに配置（Workspace 用）
+
+#### 2-3. profiles.yml の調整
+- Workspace 内では `account` と `user` はプレースホルダーでよい
+- `type: snowflake` は必須
+- dev / prod ターゲットを定義
+
+```yaml
+dbt_handson_project:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: "placeholder"
+      user: "placeholder"
+      warehouse: COMPUTE_WH
+      database: DBT_PROJECT_DB
+      schema: DEV
+      role: TRANSFORMER
+    prod:
+      type: snowflake
+      account: "placeholder"
+      user: "placeholder"
+      warehouse: COMPUTE_WH
+      database: DBT_PROJECT_DB
+      schema: PROD
+      role: TRANSFORMER
+```
+
+#### 2-4. API Integration の作成（GitHub 接続用）
+```sql
+-- GitHub Personal Access Token をシークレットとして登録（プライベートリポの場合）
+CREATE OR REPLACE SECRET DBT_PROJECT_DB.INTEGRATIONS.github_secret
+  TYPE = PASSWORD
+  USERNAME = '<github_username>'
+  PASSWORD = '<github_pat>';
+
+-- API Integration の作成
+CREATE OR REPLACE API INTEGRATION github_api_integration
+  API_PROVIDER = git_https_api
+  API_ALLOWED_PREFIXES = ('https://github.com/<your_org>/')
+  ALLOWED_AUTHENTICATION_SECRETS = (DBT_PROJECT_DB.INTEGRATIONS.github_secret)
+  ENABLED = TRUE;
+```
+
+#### 2-5. External Access Integration の作成（dbt deps 用）
+```sql
+CREATE OR REPLACE NETWORK RULE DBT_PROJECT_DB.INTEGRATIONS.dbt_network_rule
+  MODE = EGRESS
+  TYPE = HOST_PORT
+  VALUE_LIST = ('hub.getdbt.com', 'codeload.github.com');
+
+CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION dbt_ext_access
+  ALLOWED_NETWORK_RULES = (DBT_PROJECT_DB.INTEGRATIONS.dbt_network_rule)
+  ENABLED = TRUE;
+```
+
+#### 2-6. 監視の有効化
+```sql
+ALTER SCHEMA DBT_PROJECT_DB.DEV SET LOG_LEVEL = 'INFO';
+ALTER SCHEMA DBT_PROJECT_DB.DEV SET TRACE_LEVEL = 'ALWAYS';
+ALTER SCHEMA DBT_PROJECT_DB.DEV SET METRIC_LEVEL = 'ALL';
+
+ALTER SCHEMA DBT_PROJECT_DB.PROD SET LOG_LEVEL = 'INFO';
+ALTER SCHEMA DBT_PROJECT_DB.PROD SET TRACE_LEVEL = 'ALWAYS';
+ALTER SCHEMA DBT_PROJECT_DB.PROD SET METRIC_LEVEL = 'ALL';
+```
+
+---
+
+### Step 3: Workspace の作成と操作
+
+#### 3-1. Workspace の作成
+- Snowsight → Projects → Workspaces → Create Workspace → From Git repository
+- GitHub リポジトリと API Integration を指定
+
+#### 3-2. Workspace 内での dbt 操作
+- `dbt deps`: 依存パッケージのインストール（External Access Integration 必要）
+- `dbt compile`: コンパイル + DAG 可視化
+- `dbt run --target dev`: dev 環境でモデル実行
+- `dbt test`: テスト実行
+- `dbt build`: 一括実行
+
+#### 3-3. DAG の可視化
+- `dbt compile` 後に Workspace 上でグラフィカルに DAG を確認
+- モデル間の依存関係をインタラクティブに探索
+
+#### 3-4. コード編集とGit操作
+- Workspace 上でファイル編集可能
+- 変更の diff 確認、コミット、プッシュ（プライベートリポのみ）
+
+---
+
+### Step 4: スキーマ生成のカスタマイズ
+
+#### 4-1. デフォルトのスキーマ命名規則
+- `target_schema` = `DEV`、`custom_schema` = `marts` の場合
+- デフォルト: `DEV_marts`（連結される）
+- 開発者同士の衝突を防ぐための仕組み
+
+#### 4-2. generate_schema_name マクロのオーバーライド
+```sql
+{% macro generate_schema_name(custom_schema_name, node) -%}
+    {%- set default_schema = target.schema -%}
+    {%- if custom_schema_name is none -%}
+        {{ default_schema }}
+    {%- elif target.name == 'prod' -%}
+        {{ custom_schema_name | trim }}
+    {%- else -%}
+        {{ default_schema }}_{{ custom_schema_name | trim }}
+    {%- endif -%}
+{%- endmacro %}
+```
+
+| 環境 | custom_schema 指定あり | custom_schema 指定なし |
+|---|---|---|
+| dev | `DEV_marts` | `DEV` |
+| prod | `marts` | `PROD` |
+
+#### 4-3. 注意点
+- ターゲットスキーマは **事前に作成** しておく必要がある
+- dbt Project Object のコンパイル・実行時にスキーマが存在しないとエラー
+
+---
+
+### Step 5: デプロイ
+
+#### 5-1. デプロイの3つの方法
+| 方法 | 用途 |
+|---|---|
+| **Snowsight（Workspace）** | 開発時の手動デプロイ |
+| **SQL コマンド** | 自動化・スクリプト化 |
+| **Snowflake CLI（`snow`）** | CI/CD パイプライン |
+
+#### 5-2. Workspace からデプロイ
+- Workspace → Connect → Deploy dbt project
+- Database, Schema, プロジェクト名, デフォルトターゲットを指定
+
+#### 5-3. SQL コマンドでデプロイ
+```sql
+-- 新規作成（VERSION$1）
+CREATE DBT PROJECT DBT_PROJECT_DB.PROD.dbt_handson
+  FROM 'snow://workspace/<workspace_path>/versions/live'
+  DEFAULT_TARGET = 'prod'
+  EXTERNAL_ACCESS_INTEGRATIONS = (dbt_ext_access)
+  COMMENT = 'dbt ハンズオンプロジェクト';
+
+-- バージョン追加（VERSION$2）
+ALTER DBT PROJECT DBT_PROJECT_DB.PROD.dbt_handson
+  ADD VERSION
+  FROM 'snow://workspace/<workspace_path>/versions/live';
+```
+
+#### 5-4. Snowflake CLI でデプロイ
+```bash
+snow dbt deploy dbt_handson --source ./dbt_handson_project --force
+snow dbt deploy dbt_handson --source ./dbt_handson_project --default-target dev \
+  --external-access-integration dbt_ext_access --force
+```
+
+#### 5-5. ソースファイルの配置場所
+| ソース | 説明 |
+|---|---|
+| Git リポジトリステージ | `'@db.schema.git_stage/branches/main/path'` |
+| 既存 dbt Project | `'snow://dbt/db.schema.project/versions/last'` |
+| 内部ステージ | `'@db.schema.stage/path'` |
+| Workspace | `'snow://workspace/.../versions/live/path'` |
+
+#### 5-6. デプロイの確認
+```sql
+SHOW DBT PROJECTS IN DATABASE DBT_PROJECT_DB;
+```
+
+---
+
+### Step 6: 実行とスケジューリング
+
+#### 6-1. SQL での実行
+```sql
+-- dbt run（dev ターゲット）
+EXECUTE DBT PROJECT DBT_PROJECT_DB.PROD.dbt_handson
+  ARGS = 'run --target dev';
+
+-- dbt build（prod ターゲット）
+EXECUTE DBT PROJECT DBT_PROJECT_DB.PROD.dbt_handson
+  ARGS = 'build --target prod';
+
+-- dbt test
+EXECUTE DBT PROJECT DBT_PROJECT_DB.PROD.dbt_handson
+  ARGS = 'test --target prod';
+```
+
+#### 6-2. Snowflake CLI での実行
+```bash
+snow dbt execute dbt_handson run --target dev
+snow dbt execute dbt_handson build --target prod
+```
+
+#### 6-3. Snowflake Task によるスケジューリング
+```sql
+-- 6時間ごとに dbt build を実行
+CREATE OR REPLACE TASK DBT_PROJECT_DB.PROD.run_dbt_handson
+  WAREHOUSE = COMPUTE_WH
+  SCHEDULE = '6 hours'
+AS
+  EXECUTE DBT PROJECT DBT_PROJECT_DB.PROD.dbt_handson
+    ARGS = 'build --target prod';
+
+-- 依存タスク: build の後にテスト実行
+CREATE OR REPLACE TASK DBT_PROJECT_DB.PROD.test_dbt_handson
+  WAREHOUSE = COMPUTE_WH
+  AFTER DBT_PROJECT_DB.PROD.run_dbt_handson
+AS
+  EXECUTE DBT PROJECT DBT_PROJECT_DB.PROD.dbt_handson
+    ARGS = 'test --target prod';
+
+-- タスクの有効化（子タスクから先に RESUME）
+ALTER TASK DBT_PROJECT_DB.PROD.test_dbt_handson RESUME;
+ALTER TASK DBT_PROJECT_DB.PROD.run_dbt_handson RESUME;
+```
+
+- Task は dbt Project Object と**同じ Database・Schema** に作成する必要がある
+
+#### 6-4. Cron スケジュール
+```sql
+-- 毎日午前2時（JST）に実行
+CREATE OR REPLACE TASK DBT_PROJECT_DB.PROD.nightly_dbt_build
+  WAREHOUSE = COMPUTE_WH
+  SCHEDULE = 'USING CRON 0 2 * * * Asia/Tokyo'
+AS
+  EXECUTE DBT PROJECT DBT_PROJECT_DB.PROD.dbt_handson
+    ARGS = 'build --target prod';
+```
+
+---
+
+### Step 7: アクセス制御
+
+#### 7-1. 権限の種類
+| 操作 | 必要な権限 | GRANT 文 |
+|---|---|---|
+| dbt Project 作成 | `CREATE DBT PROJECT` | `GRANT CREATE DBT PROJECT ON SCHEMA ... TO ROLE ...;` |
+| 変更・削除 | `OWNERSHIP` | `GRANT OWNERSHIP ON DBT PROJECT ... TO ROLE ...;` |
+| 実行・ファイルアクセス | `USAGE` | `GRANT USAGE ON DBT PROJECT ... TO ROLE ...;` |
+| Snowsight で閲覧 | `MONITOR` | `GRANT MONITOR ON DBT PROJECT ... TO ROLE ...;` |
+
+#### 7-2. ロール設計例
+```sql
+-- dbt 開発者ロール
+CREATE ROLE IF NOT EXISTS DBT_DEVELOPER;
+GRANT CREATE DBT PROJECT ON SCHEMA DBT_PROJECT_DB.DEV TO ROLE DBT_DEVELOPER;
+GRANT USAGE ON WAREHOUSE COMPUTE_WH TO ROLE DBT_DEVELOPER;
+
+-- dbt 運用ロール
+CREATE ROLE IF NOT EXISTS DBT_OPERATOR;
+GRANT USAGE ON DBT PROJECT DBT_PROJECT_DB.PROD.dbt_handson TO ROLE DBT_OPERATOR;
+GRANT MONITOR ON DBT PROJECT DBT_PROJECT_DB.PROD.dbt_handson TO ROLE DBT_OPERATOR;
+
+-- アナリストロール（閲覧のみ）
+CREATE ROLE IF NOT EXISTS ANALYST;
+GRANT MONITOR ON DBT PROJECT DBT_PROJECT_DB.PROD.dbt_handson TO ROLE ANALYST;
+```
+
+#### 7-3. 実行時のロール解決
+| コンテキスト | ロール解決順序 |
+|---|---|
+| SQL / CLI | 接続ロール → `profiles.yml` の `role` |
+| Workspace | 選択ロール → `profiles.yml` の `role` + セカンダリロール |
+| Task | タスクオーナーの権限（個人ユーザーに紐づかない） |
+
+---
+
+### Step 8: CI/CD パイプライン（GitHub Actions）
+
+#### 8-1. OIDC サービスユーザーの作成
+```sql
+CREATE USER IF NOT EXISTS github_actions_service_user
+  TYPE = SERVICE
+  WORKLOAD_IDENTITY = (
+    TYPE = OIDC
+    ISSUER = 'https://token.actions.githubusercontent.com',
+    SUBJECT = 'repo:<your_org>/<your_repo>:environment:prod'
+  )
+  DEFAULT_ROLE = DBT_OPERATOR
+  COMMENT = 'GitHub Actions 用サービスユーザー';
+```
+
+#### 8-2. ネットワークポリシー
+```sql
+CREATE NETWORK POLICY github_actions_policy
+  ALLOWED_NETWORK_RULE_LIST = ('SNOWFLAKE.NETWORK_SECURITY.GITHUBACTIONS_GLOBAL')
+  BLOCKED_NETWORK_RULE_LIST = ();
+
+ALTER USER github_actions_service_user SET NETWORK_POLICY = github_actions_policy;
+```
+
+#### 8-3. GitHub Secrets / Variables の設定
+- **Secrets:** `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`
+- **Variables:** `SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`
+
+#### 8-4. CI ワークフロー（PR 時）
+```yaml
+# .github/workflows/incoming_pr.yml
+name: CI - dbt Test
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  dbt-test:
+    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      SNOWFLAKE_CLI_FEATURES_ENABLE_DBT: true
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_DATABASE: ${{ vars.SNOWFLAKE_DATABASE }}
+      SNOWFLAKE_SCHEMA: ${{ vars.SNOWFLAKE_SCHEMA }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: snowflakedb/snowflake-cli-action@v2.0
+        with:
+          use-oidc: true
+      - run: snow dbt deploy ci_test_project --source ./dbt_handson_project --force -x
+      - run: snow dbt execute -x ci_test_project run --target dev
+      - run: snow dbt execute -x ci_test_project test --target dev
+```
+
+#### 8-5. CD ワークフロー（マージ時）
+```yaml
+# .github/workflows/deploy_prod.yml
+name: CD - Deploy to Production
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  dbt-deploy:
+    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      SNOWFLAKE_CLI_FEATURES_ENABLE_DBT: true
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_DATABASE: ${{ vars.SNOWFLAKE_DATABASE }}
+      SNOWFLAKE_SCHEMA: ${{ vars.SNOWFLAKE_SCHEMA }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: snowflakedb/snowflake-cli-action@v2.0
+        with:
+          use-oidc: true
+      - run: snow dbt deploy dbt_handson --source ./dbt_handson_project --force -x
+```
+
+- `-x` フラグは一時的な接続を使用（保存された認証情報不要）
+
+---
+
+### Step 9: 監視とオブザーバビリティ
+
+#### 9-1. Snowsight での監視
+- Transformation → dbt Projects で一覧表示
+- 実行履歴、ステータス、所要時間、クエリ詳細を確認
+- `MONITOR` 権限が必要
+
+#### 9-2. プログラムによるアーティファクト取得
+| 関数 | 戻り値 | 用途 |
+|---|---|---|
+| `SYSTEM$GET_DBT_LOG(query_id)` | テキストログ | デバッグ |
+| `SYSTEM$LOCATE_DBT_ARTIFACTS(query_id)` | アーティファクトフォルダパス | manifest.json 等の個別取得 |
+| `SYSTEM$LOCATE_DBT_ARCHIVE(query_id)` | ZIP ファイルURL | 一括ダウンロード |
+
+#### 9-3. 実行履歴の取得
+```sql
+-- 最新の実行クエリIDを取得
+SET latest_query_id = (
+  SELECT query_id
+  FROM TABLE(INFORMATION_SCHEMA.DBT_PROJECT_EXECUTION_HISTORY())
+  WHERE OBJECT_NAME = 'DBT_HANDSON'
+  ORDER BY query_end_time DESC
+  LIMIT 1
+);
+
+-- ログ出力
+SELECT SYSTEM$GET_DBT_LOG($latest_query_id);
+
+-- アーティファクトの場所
+SELECT SYSTEM$LOCATE_DBT_ARTIFACTS($latest_query_id);
+```
+
+#### 9-4. アーティファクトのステージへのコピー
+```sql
+CREATE OR REPLACE STAGE DBT_PROJECT_DB.PROD.dbt_artifacts_stage
+  ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
+
+COPY FILES
+  INTO @DBT_PROJECT_DB.PROD.dbt_artifacts_stage/results/
+  FROM 'snow://dbt/DBT_PROJECT_DB.PROD.DBT_HANDSON/results/<query_id>/';
+```
+
+---
+
+### Step 10: 依存関係の管理
+
+#### 10-1. dbt deps の2つの実行方法
+| 方法 | 場所 | External Access Integration |
+|---|---|---|
+| Workspace 内で実行 | Snowflake 上 | 必要 |
+| ローカル / CI で実行 | 外部 | 不要（`dbt_packages/` ごとデプロイ） |
+
+#### 10-2. デプロイ時の自動 deps
+```sql
+CREATE DBT PROJECT DBT_PROJECT_DB.PROD.dbt_handson
+  FROM '@db.schema.stage/path'
+  EXTERNAL_ACCESS_INTEGRATIONS = (dbt_ext_access);
+```
+
+CLI の場合:
+```bash
+snow dbt deploy dbt_handson --source ./dbt_handson_project --install-local-deps
+```
+
+#### 10-3. クロスプロジェクト依存の制限
+- `local: ../other_project` は**非対応**
+- ワークアラウンド: 依存プロジェクトをプロジェクトルート内にコピー
+
+```bash
+mkdir local_packages
+cp -R ../other_project ./local_packages/other_project
+```
+
+```yaml
+# packages.yml
+packages:
+  - local: local_packages/other_project
+```
+
+---
+
+## 進め方
+- 既存の dbt_handson_project を拡張する形で進める
+- Step 2 の環境セットアップから順に実施
+- 各ステップで Snowflake / GitHub 上で動作を確認する
+- 疑問点はその都度解消しながら進める
+
 ## Claudeの動作ルール
 - ファイルの作成・編集は Claude が直接行わない
 - 実行すべきコマンドや手順を案内するだけにする（ユーザー自身が実行する）

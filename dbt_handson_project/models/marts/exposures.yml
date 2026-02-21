@@ -1,0 +1,12 @@
+exposures:
+  - name: jaffle_shop_dashboard
+    type: dashboard
+    description: "Jaffle Shop の売上分析ダッシュボード"
+    maturity: medium
+    owner:
+      name: Analytics Team
+      email: analytics@example.com
+    depends_on:
+      - ref('fct_orders')
+      - ref('dim_customers')
+    url: https://bi.example.com/dashboards/jaffle-shop

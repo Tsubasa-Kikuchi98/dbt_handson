@@ -1,0 +1,33 @@
+version: 2
+
+models:
+  - name: stg_jaffle_shop__customers
+    description: "顧客マスタの staging モデル。カラム名を統一。"
+    columns:
+      - name: customer_id
+        description: "顧客の一意識別子"
+        data_tests:
+          - unique
+          - not_null
+
+  - name: stg_jaffle_shop__orders
+    description: "注文データの staging モデル。カラム名を統一。"
+    columns:
+      - name: order_id
+        description: "注文の一意識別子"
+        data_tests:
+          - unique
+          - not_null
+      - name: customer_id
+        description: "注文した顧客のID"
+        data_tests:
+          - not_null
+
+  - name: stg_jaffle_shop__payments
+    description: "支払データの staging モデル。カラム名を統一、金額はセント単位。"
+    columns:
+      - name: payment_id
+        description: "支払の一意識別子"
+        data_tests:
+          - unique
+          - not_null

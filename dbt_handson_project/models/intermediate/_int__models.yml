@@ -1,0 +1,10 @@
+version: 2
+
+models:
+  - name: int_orders_joined
+    description: "注文と支払を結合した中間モデル。"
+    columns:
+      - name: order_id
+        description: "注文の一意識別子"
+      - name: customer_id
+        description: "顧客ID"
