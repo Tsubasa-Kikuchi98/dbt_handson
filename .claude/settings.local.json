@@ -14,7 +14,11 @@
       "Bash(gh pr merge:*)",
       "Bash(git pull:*)",
       "Bash(git stash:*)",
-      "WebFetch(domain:docs.snowflake.com)"
+      "WebFetch(domain:docs.snowflake.com)",
+      "Bash(xargs head -30)",
+      "Bash(python -m dbt --version)",
+      "Bash(source .venv/Scripts/activate)",
+      "Bash(wc -l dbt_handson_project/dbt_packages/dbt_*/dbt_project.yml)"
     ]
   }
 }
